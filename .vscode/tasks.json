@@ -57,6 +57,37 @@
       ],
       "group": "build",
       "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Build Android APK",
+      "detail": "Produce a sideloadable Release APK (installs the Android SDK on first run)",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/dev.ps1",
+        "build-apk"
+      ],
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Install APK on device",
+      "detail": "Install the built APK onto a connected Android device via adb",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/dev.ps1",
+        "install-apk"
+      ],
+      "problemMatcher": []
     }
   ]
 }

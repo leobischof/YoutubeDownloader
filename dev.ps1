@@ -10,9 +10,11 @@
 
         ./dev.ps1 start-app
 
-    Self-healing covers two layers:
+    Self-healing covers three layers:
       1. The .NET SDK itself (installed via winget if absent or too old).
       2. NuGet packages (dotnet restore).
+      3. The Android workload, SDK and JDK - only for the APK commands, so a
+         desktop-only contributor never downloads the Android toolchain.
 
     This script is the ONLY place project commands are defined. Editor tasks
     (.vscode/tasks.json) and CI must call into it - never duplicate command
@@ -23,6 +25,8 @@
     ./dev.ps1 start-app       # run the desktop app (self-heals first)
     ./dev.ps1 build-project   # build the solution in Release
     ./dev.ps1 publish-app     # produce a self-contained build for this machine
+    ./dev.ps1 build-apk       # build a sideloadable Android APK
+    ./dev.ps1 install-apk     # push that APK onto a connected device
     ./dev.ps1 help            # list all commands
 #>
 
@@ -51,6 +55,15 @@ Set-Location $RepoRoot
 
 # The app project is the entrypoint; Core is a referenced library.
 $AppProject = Join-Path $RepoRoot 'YoutubeDownloader'
+$AndroidProject = Join-Path $RepoRoot 'YoutubeDownloader.Android'
+
+# Neither ANDROID_HOME nor JAVA_HOME is set by the workload's provisioning step, so the
+# locations are pinned here and passed to every Android build explicitly.
+$AndroidSdkDir = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
+$AndroidJdkDir = Join-Path $env:LOCALAPPDATA 'Android\jdk'
+
+# The API level net10.0-android compiles against; a build fails with XA5207 without it.
+$AndroidApiLevel = 36
 
 # --- Logging gateway (single source of truth for output formatting) ----------
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
@@ -145,6 +158,70 @@ function Confirm-Deps {
     }
 }
 
+# --- Layer 3 self-healing: the Android toolchain -----------------------------
+# Only the APK commands need this, so it is kept out of Confirm-Deps: a desktop-only
+# contributor should never be made to download ~2 GB of Android SDK.
+
+function Test-AndroidWorkloadInstalled {
+    $workloads = & dotnet workload list 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    # The table lists one workload id per row; match the id at the start of a line.
+    return [bool]($workloads | Where-Object { $_ -match '^\s*android\s' })
+}
+
+function Test-AndroidSdkInstalled {
+    $androidJar = Join-Path $AndroidSdkDir "platforms\android-$AndroidApiLevel\android.jar"
+    $java = Join-Path $AndroidJdkDir 'bin\java.exe'
+    return (Test-Path $androidJar) -and (Test-Path $java)
+}
+
+function Install-AndroidWorkload {
+    Write-Step 'Installing the .NET Android workload (~1 GB)'
+    Invoke-Native -What 'workload install android' -Action {
+        dotnet workload install android --skip-manifest-update
+    }
+    Write-Ok 'Android workload installed'
+}
+
+function Install-AndroidSdk {
+    Write-Step "Installing the Android SDK (API $AndroidApiLevel) and JDK"
+    # The workload ships this target; it provisions both the SDK and a JDK, so neither
+    # Android Studio nor a manual JDK install is needed.
+    Invoke-Native -What 'InstallAndroidDependencies' -Action {
+        dotnet build $AndroidProject `
+            -t:InstallAndroidDependencies `
+            -f net10.0-android `
+            -p:AndroidSdkDirectory=$AndroidSdkDir `
+            -p:JavaSdkDirectory=$AndroidJdkDir `
+            -p:AcceptAndroidSDKLicenses=True `
+            -p:DownloadFFmpegAndroid=false `
+            -v:minimal
+    }
+    Write-Ok 'Android SDK and JDK installed'
+}
+
+# Self-healing guard for the APK commands.
+function Confirm-AndroidDeps {
+    Confirm-Deps
+
+    if (-not (Test-AndroidWorkloadInstalled)) {
+        Write-Warn 'Android workload missing - installing now (this takes a few minutes)'
+        Install-AndroidWorkload
+    }
+    if (-not (Test-AndroidSdkInstalled)) {
+        Write-Warn 'Android SDK or JDK missing - installing now (this takes a few minutes)'
+        Install-AndroidSdk
+    }
+}
+
+# Every Android build needs these; kept in one place so they cannot drift apart.
+function Get-AndroidBuildArgs {
+    return @(
+        "-p:AndroidSdkDirectory=$AndroidSdkDir",
+        "-p:JavaSdkDirectory=$AndroidJdkDir"
+    )
+}
+
 # --- Commands ----------------------------------------------------------------
 # One function per command (single concern). Descriptive verb-noun names.
 
@@ -195,6 +272,77 @@ function Invoke-FormatCode {
     Write-Ok 'Formatting applied'
 }
 
+function Invoke-BuildApk {
+    Confirm-AndroidDeps
+
+    # Release by default: that is the build you would actually put on a phone. Override
+    # with e.g. ./dev.ps1 build-apk -- -c Debug
+    Write-Step 'Building Android APK (Release)'
+    $androidArgs = Get-AndroidBuildArgs
+    Invoke-Native -What 'build-apk' -Action {
+        dotnet build $AndroidProject -c Release $SkipFormatter @androidArgs @Rest
+    }
+
+    $apk = Get-ChildItem -Path (Join-Path $AndroidProject 'bin') -Filter '*-Signed.apk' -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    # A green build with no APK means the packaging step was skipped; surface that rather
+    # than letting it look like success.
+    if (-not $apk) { throw 'build-apk reported success but produced no signed APK.' }
+
+    Write-Ok "APK: $($apk.FullName)"
+    Write-Host (
+        '      {0:N0} MB, signed with the Android debug key - enable "install from unknown sources" to sideload' -f ($apk.Length / 1MB)
+    ) -ForegroundColor DarkGray
+}
+
+function Invoke-InstallApk {
+    $adb = Join-Path $AndroidSdkDir 'platform-tools\adb.exe'
+    if (-not (Test-Path $adb)) {
+        throw "adb not found at $adb. Run ./dev.ps1 build-apk first to provision the Android SDK."
+    }
+
+    # On first use adb forks a background daemon that inherits stdout. If that output is a
+    # captured pipe - as it is below, and in any editor task - the pipe never closes and the
+    # call blocks. Start the daemon first with its output pinned to files instead, so it
+    # inherits file handles rather than the pipe.
+    # This step alone can take over a minute the first time (virus scanners inspect the
+    # daemon); afterwards it returns instantly.
+    Write-Step 'Starting the adb server'
+    $adbOut = [System.IO.Path]::GetTempFileName()
+    $adbErr = [System.IO.Path]::GetTempFileName()
+    try {
+        Start-Process -FilePath $adb -ArgumentList 'start-server' -NoNewWindow -Wait `
+            -RedirectStandardOutput $adbOut -RedirectStandardError $adbErr
+    } finally {
+        Remove-Item $adbOut, $adbErr -Force -ErrorAction SilentlyContinue
+    }
+
+    # Only devices in the 'device' state can be installed to; 'unauthorized' means the USB
+    # debugging prompt on the phone has not been accepted yet.
+    $devices = @(& $adb devices | Select-Object -Skip 1 | Where-Object { $_ -match '\sdevice$' })
+    if ($devices.Count -eq 0) {
+        throw 'No authorised Android device found. Connect one with USB debugging enabled and accept the prompt on the device.'
+    }
+
+    $apk = Get-ChildItem -Path (Join-Path $AndroidProject 'bin') -Filter '*-Signed.apk' -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if (-not $apk) {
+        Write-Warn 'No APK built yet - building one now'
+        Invoke-BuildApk
+        $apk = Get-ChildItem -Path (Join-Path $AndroidProject 'bin') -Filter '*-Signed.apk' -Recurse |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
+
+    Write-Step "Installing $($apk.Name) to the connected device"
+    Invoke-Native -What 'install-apk' -Action { & $adb install -r $apk.FullName }
+    Write-Ok 'Installed'
+}
+
 function Invoke-CleanAll {
     Write-Step 'Cleaning build artifacts'
     # Remove bin/ and obj/ from every project rather than a hardcoded list, so new
@@ -241,6 +389,8 @@ function Show-Help {
     Write-Cmd 'start-app'      'Run the desktop app (installs prerequisites first)'
     Write-Cmd 'build-project'  'Build the whole solution in Release'
     Write-Cmd 'publish-app'    'Produce a self-contained build under YoutubeDownloader/bin/publish'
+    Write-Cmd 'build-apk'      'Build a sideloadable Android APK (installs the Android SDK if needed)'
+    Write-Cmd 'install-apk'    'Install the built APK onto a connected Android device via adb'
     Write-Cmd 'format-code'    'Apply CSharpier formatting (what CI checks)'
     Write-Cmd 'clean-all'      'Delete every bin/ and obj/ directory'
     Write-Cmd 'help'           'Show this help'
@@ -253,6 +403,8 @@ switch ($Command.ToLowerInvariant()) {
     'start-app'     { Invoke-StartApp }
     'build-project' { Invoke-BuildProject }
     'publish-app'   { Invoke-PublishApp }
+    'build-apk'     { Invoke-BuildApk }
+    'install-apk'   { Invoke-InstallApk }
     'format-code'   { Invoke-FormatCode }
     'clean-all'     { Invoke-CleanAll }
     'help'          { Show-Help }
