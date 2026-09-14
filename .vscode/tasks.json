@@ -1,0 +1,62 @@
+{
+  // VS Code tasks for this repo. Each task ONLY invokes ./dev.ps1 <command>.
+  // dev.ps1 is the single source of truth for command logic - never duplicate it here.
+  //
+  // Only the day-to-day commands are exposed. Occasional ones (publish-app,
+  // format-code, clean-all) stay in dev.ps1 only - run `./dev.ps1 help` for the
+  // complete list.
+  //
+  // This machine has Windows PowerShell 5.1; on a machine with PowerShell 7,
+  // switch "powershell" -> "pwsh" below.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start app",
+      "detail": "Run the YoutubeDownloader desktop app (installs the SDK and packages first) - the everyday command",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/dev.ps1",
+        "start-app"
+      ],
+      "isBackground": true,
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Install dependencies",
+      "detail": "Install the .NET SDK if missing, then restore NuGet packages",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/dev.ps1",
+        "install-deps"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Build project",
+      "detail": "Build the whole solution in Release",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/dev.ps1",
+        "build-project"
+      ],
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}
